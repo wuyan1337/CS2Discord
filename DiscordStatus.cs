@@ -1,13 +1,12 @@
 using System;
 using System.IO;
-using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
-using CounterStrikeSharp.API.Core.Attributes.Registration;
-using CounterStrikeSharp.API.Modules.Timers;
 using Discord;
 using Discord.WebSocket;
 using Microsoft.Extensions.Logging;
@@ -17,25 +16,21 @@ namespace DiscordStatus;
 public class PluginConfig
 {
     public string BotToken { get; set; } = "";
-    public int UpdateIntervalSeconds { get; set; } = 30;
+    public int UpdateIntervalSeconds { get; set; } = 15;
+    public int ServerPort { get; set; } = 27015;
 }
 
 public class DiscordStatus : BasePlugin
 {
     public override string ModuleName => "DiscordStatus";
-    public override string ModuleVersion => "1.5.0";
+    public override string ModuleVersion => "2.0.0";
     public override string ModuleAuthor => "Shinori";
 
     private DiscordSocketClient? _client;
     private PluginConfig _config = new();
     private string _lastStatus = "";
     private volatile bool _botReady = false;
-    private System.Threading.Timer? _discordTimer;
-
-    // Server data - updated on game events
-    private int _playerCount = 0;
-    private int _maxPlayers = 64;
-    private string _mapName = "unknown";
+    private System.Threading.Timer? _pollTimer;
 
     public override void Load(bool hotReload)
     {
@@ -46,13 +41,6 @@ public class DiscordStatus : BasePlugin
             Logger.LogError("[DiscordStatus] BotToken is empty! Set it in config.json");
             return;
         }
-
-        RegisterEventHandler<EventPlayerConnect>(OnPlayerConnect);
-        RegisterEventHandler<EventPlayerDisconnect>(OnPlayerDisconnect);
-        RegisterListener<Listeners.OnMapStart>(OnMapStart);
-
-        if (hotReload)
-            CollectData();
 
         Task.Run(async () =>
         {
@@ -66,14 +54,14 @@ public class DiscordStatus : BasePlugin
             }
         });
 
-        Logger.LogInformation("[DiscordStatus] Plugin loaded");
+        Logger.LogInformation("[DiscordStatus] Plugin loaded (v2.0 - A2S polling, port {Port})", _config.ServerPort);
     }
 
     public override void Unload(bool hotReload)
     {
         _botReady = false;
-        _discordTimer?.Dispose();
-        _discordTimer = null;
+        _pollTimer?.Dispose();
+        _pollTimer = null;
 
         if (_client != null)
         {
@@ -86,39 +74,6 @@ public class DiscordStatus : BasePlugin
         }
 
         Logger.LogInformation("[DiscordStatus] Plugin unloaded");
-    }
-
-    private void OnMapStart(string mapName)
-    {
-        _mapName = mapName;
-        PushStatusUpdate();
-    }
-
-    private HookResult OnPlayerConnect(EventPlayerConnect @event, GameEventInfo info)
-    {
-        AddTimer(2.0f, () => { CollectData(); PushStatusUpdate(); });
-        return HookResult.Continue;
-    }
-
-    private HookResult OnPlayerDisconnect(EventPlayerDisconnect @event, GameEventInfo info)
-    {
-        AddTimer(1.0f, () => { CollectData(); PushStatusUpdate(); });
-        return HookResult.Continue;
-    }
-
-    private void CollectData()
-    {
-        try
-        {
-            _playerCount = Utilities.GetPlayers()
-                .Where(p => p is { IsValid: true, IsBot: false, IsHLTV: false })
-                .Count();
-            _maxPlayers = Server.MaxPlayers;
-            var map = Server.MapName;
-            if (!string.IsNullOrEmpty(map))
-                _mapName = map;
-        }
-        catch { }
     }
 
     private async Task StartBot()
@@ -141,11 +96,13 @@ public class DiscordStatus : BasePlugin
         _client.Ready += () =>
         {
             _botReady = true;
-            _discordTimer?.Dispose();
-            _discordTimer = new System.Threading.Timer(
-                _ => PushStatusUpdate(),
+            Logger.LogInformation("[DiscordStatus] Bot ready, starting A2S poll timer every {Sec}s", _config.UpdateIntervalSeconds);
+
+            _pollTimer?.Dispose();
+            _pollTimer = new System.Threading.Timer(
+                _ => PollAndUpdate(),
                 null,
-                TimeSpan.FromSeconds(3),
+                TimeSpan.FromSeconds(2),
                 TimeSpan.FromSeconds(_config.UpdateIntervalSeconds));
             return Task.CompletedTask;
         };
@@ -160,27 +117,130 @@ public class DiscordStatus : BasePlugin
         await _client.StartAsync();
     }
 
-    private void PushStatusUpdate()
+    private void PollAndUpdate()
     {
         if (!_botReady || _client == null || _client.ConnectionState != ConnectionState.Connected)
             return;
 
-        var statusText = $"{_playerCount}/{_maxPlayers} Players | {_mapName}";
-
-        if (statusText == _lastStatus)
-            return;
-
-        _lastStatus = statusText;
-
-        _ = Task.Run(async () =>
+        try
         {
-            try
+            var info = QueryA2SInfo("127.0.0.1", _config.ServerPort);
+            if (info == null)
+                return;
+
+            var statusText = $"{info.Value.players}/{info.Value.maxPlayers} Players | {info.Value.map}";
+
+            if (statusText == _lastStatus)
+                return;
+
+            _lastStatus = statusText;
+            Logger.LogInformation("[DiscordStatus] Status: {Status}", statusText);
+
+            _ = Task.Run(async () =>
             {
-                await _client!.SetGameAsync(statusText, null, ActivityType.Playing);
-                await _client.SetStatusAsync(UserStatus.Online);
+                try
+                {
+                    await _client!.SetGameAsync(statusText, null, ActivityType.Playing);
+                    await _client.SetStatusAsync(UserStatus.Online);
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError("[DiscordStatus] Push failed: {Message}", ex.Message);
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning("[DiscordStatus] Poll error: {Message}", ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// A2S_INFO query - works even when server is hibernating
+    /// </summary>
+    private (int players, int maxPlayers, string map)? QueryA2SInfo(string host, int port)
+    {
+        try
+        {
+            using var udp = new UdpClient();
+            udp.Client.ReceiveTimeout = 3000;
+            udp.Client.SendTimeout = 3000;
+
+            var endpoint = new IPEndPoint(IPAddress.Parse(host), port);
+
+            // A2S_INFO request: FF FF FF FF 54 + "Source Engine Query\0"
+            byte[] request = new byte[] {
+                0xFF, 0xFF, 0xFF, 0xFF, 0x54,
+                0x53, 0x6F, 0x75, 0x72, 0x63, 0x65, 0x20,
+                0x45, 0x6E, 0x67, 0x69, 0x6E, 0x65, 0x20,
+                0x51, 0x75, 0x65, 0x72, 0x79, 0x00
+            };
+
+            udp.Send(request, request.Length, endpoint);
+
+            var remoteEp = new IPEndPoint(IPAddress.Any, 0);
+            byte[] response = udp.Receive(ref remoteEp);
+
+            // Check if it's a challenge response (0x41)
+            if (response.Length >= 9 && response[4] == 0x41)
+            {
+                // Resend with challenge
+                byte[] challengeRequest = new byte[request.Length + 4];
+                Array.Copy(request, challengeRequest, request.Length);
+                challengeRequest[request.Length] = response[5];
+                challengeRequest[request.Length + 1] = response[6];
+                challengeRequest[request.Length + 2] = response[7];
+                challengeRequest[request.Length + 3] = response[8];
+
+                udp.Send(challengeRequest, challengeRequest.Length, endpoint);
+                response = udp.Receive(ref remoteEp);
             }
-            catch { }
-        });
+
+            if (response.Length < 10 || response[4] != 0x49)
+                return null;
+
+            // Parse A2S_INFO response
+            int offset = 5; // Skip header (FF FF FF FF 49)
+            offset++; // Protocol
+
+            // Name (null-terminated string)
+            SkipString(response, ref offset);
+            // Map
+            string map = ReadString(response, ref offset);
+            // Folder
+            SkipString(response, ref offset);
+            // Game
+            SkipString(response, ref offset);
+            // Steam App ID (short)
+            offset += 2;
+            // Players
+            int players = response[offset++];
+            // Max players
+            int maxPlayers = response[offset++];
+
+            return (players, maxPlayers, map);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private string ReadString(byte[] data, ref int offset)
+    {
+        int start = offset;
+        while (offset < data.Length && data[offset] != 0)
+            offset++;
+        var str = Encoding.UTF8.GetString(data, start, offset - start);
+        offset++; // skip null terminator
+        return str;
+    }
+
+    private void SkipString(byte[] data, ref int offset)
+    {
+        while (offset < data.Length && data[offset] != 0)
+            offset++;
+        offset++; // skip null terminator
     }
 
     private void LoadConfig()
